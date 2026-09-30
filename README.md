@@ -1,3 +1,5 @@
+> **ldafogel fork:** experimental programmable springs/detents. See [FORK.md](FORK.md) for the protocol, build, limitations and upstream update workflow.
+
 # FaderBuddy
 
 The FaderBuddy is a modular control board for 60mm motorized linear potentiometers, making it simple to add

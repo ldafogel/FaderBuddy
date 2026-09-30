@@ -24,6 +24,7 @@
 #include "util.h"
 #include "motor_cal.h"
 #include "motor_control.h"
+#include "shared/custom_haptics.h"
 
 // App metadata footer for the I2C bootloader host (see BL_APP_META_ADDR):
 // the two bytes at the fixed end-of-flash address, always equal to the same
@@ -80,6 +81,10 @@ const uint8_t FW_VERSION_FOOTER[2] = {
 #define HAPTIC_MAX_PWM (254)            // Maximum PWM value
 #define HAPTIC_MAGNET_RANGE (60)        // Active range for magnetic endpoints (ADC units)
 #define HAPTIC_BASE_MULTIPLIER (3.0f)   // Base force multiplier for haptics
+
+#ifndef FB_ENABLE_DOUBLE_TAP
+#define FB_ENABLE_DOUBLE_TAP 1
+#endif
 
 // Tap detection timing
 #define TAP_MAX_DURATION (200)            // Maximum tap press duration (ms)
@@ -164,7 +169,7 @@ int16_t target_adc = 512;
 uint8_t current_register = REG_VERSION;  // Track which register was last accessed
 
 // Haptic configuration storage
-uint32_t haptic_config = 0;  // Bit-packed haptic configuration register (currently active layer's config)
+uint16_t haptic_config = 0;  // Bit-packed haptic configuration register (currently active layer's config)
 
 // Layer state storage (27 bytes total) - Protocol v5+
 uint16_t layer_haptic_configs[8];      // 16 bytes - 16-bit haptic config per layer
@@ -188,6 +193,11 @@ uint32_t state = (Mode::MODE_INPUT_IDLE << STATE_MODE_bp);
 
 // Main loop -> ISR communication (outgoing state for I2C reads)
 volatile uint32_t i2c_outgoing_state = state;
+
+custom_haptics::Spring customSpring;
+volatile uint8_t i2c_custom_config[custom_haptics::size];
+volatile bool i2c_custom_pending=false, i2c_custom_renew=false;
+volatile uint8_t i2c_custom_active=0;
 
 // ISR -> Main loop communication (incoming requests from I2C writes)
 volatile bool i2c_clear_error_request = false;
@@ -275,6 +285,7 @@ Mode get_mode() {
 }
 
 void set_mode(Mode mode) {
+  if(mode!=MODE_INPUT_IDLE && mode!=MODE_INPUT_ACTIVE)customSpring.stop();
   state = (state & ~STATE_MODE_bm) | (mode << STATE_MODE_bp);
 
   if (mode != MODE_REMOTE_MOVEMENT_IN_PROGRESS) {
@@ -397,7 +408,11 @@ void i2c_write_u32(uint32_t v) {
 // IMPORTANT: This runs in ISR context - only read i2c_ prefixed state!
 void onI2cRequest() {
   uint8_t r = current_register;
-  if (r == REG_VERSION) {
+  if (r == custom_haptics::capabilityRegister) {
+      const uint8_t signature[]={'L','F','H',1};Wire.write(signature,4);
+  } else if (r == custom_haptics::leaseRegister) {
+      Wire.write(i2c_custom_active);
+  } else if (r == REG_VERSION) {
       Wire.write(I2C_PROTOCOL_VERSION);
   } else if (r == REG_FW_VERSION) {
       i2c_write_u16(FW_VERSION);
@@ -456,8 +471,7 @@ void onI2cRequest() {
   } else if (r == REG_LAYER_HAPTIC_CONFIG) {
       // Return haptic config for the previously queried layer (16 bits, big-endian)
       uint16_t config = layer_haptic_configs[queried_layer];
-      Wire.write((config >> 8) & 0xFF);  // High byte
-      Wire.write(config & 0xFF);          // Low byte
+      i2c_write_u16(config);
   } else if (r == REG_FW_VERSION) {
       // Application firmware version (16 bits, big-endian)
       Wire.write((FW_VERSION >> 8) & 0xFF);  // High byte
@@ -474,6 +488,15 @@ void onI2cReceive(int howMany) {
   current_register = Wire.read();
 
   switch (current_register) {
+    case custom_haptics::configRegister:
+      if(howMany==1+custom_haptics::size) {
+        for(uint8_t i=0;i<custom_haptics::size;++i)i2c_custom_config[i]=Wire.read();
+        i2c_custom_pending=true;
+      }
+      break;
+    case custom_haptics::leaseRegister:
+      if(howMany==2 && Wire.read()==1)i2c_custom_renew=true;
+      break;
     case REG_CAL_TOUCH:
       pending_calibrate_touch = true;
       break;
@@ -669,7 +692,9 @@ void increment_double_tap_nonce() {
 }
 
 void reset_tap_detection() {
+#if FB_ENABLE_DOUBLE_TAP
   tap_state = TAP_NONE;
+#endif
 }
 
 // How far the carriage has moved since the tap started. Raw ADC deliberately,
@@ -714,7 +739,7 @@ uint16_t get_nearest_detent_position(uint8_t detent_count, uint16_t current_posi
   // Calculate which detent index is nearest using rounding
   // detent_index = round(offset * (detent_count - 1) / range)
   // Using integer math: add half the divisor before dividing for rounding
-  uint8_t detent_index = ((uint32_t)offset * (detent_count - 1) + range / 2) / range;
+  uint8_t detent_index = ((uint16_t)offset * (detent_count - 1) + range / 2) / range;
 
   // Clamp to valid range [0, detent_count-1]
   if (detent_index >= detent_count) {
@@ -722,7 +747,7 @@ uint16_t get_nearest_detent_position(uint8_t detent_count, uint16_t current_posi
   }
 
   // Calculate position of that detent
-  return input_calib_min + ((uint32_t)detent_index * range) / (detent_count - 1);
+  return input_calib_min + ((uint16_t)detent_index * range) / (detent_count - 1);
 }
 
 // ============================================================================
@@ -813,6 +838,8 @@ void write_layer_haptic_config(uint8_t layer, uint16_t config) {
     }
   }
 
+  customSpring.stop(); // Legacy configuration explicitly takes ownership.
+
   // Store config for layer
   layer_haptic_configs[layer] = config;
 
@@ -902,11 +929,14 @@ void motor_update() {
   Mode mode = get_mode();
 
   // If we didn't get a second tap start in time, reset tap detection
+#if FB_ENABLE_DOUBLE_TAP
   if (tap_state == TAP_WAITING_FOR_DOUBLE) {
     if (now - tap_timestamp > DOUBLE_TAP_MAX_INTERVAL) {
       reset_tap_detection();
     }
   }
+
+#endif
 
   // Hysteresis window: `position` only follows input_ewma once it leaves the
   // window, so ADC noise at rest can't read as user input.
@@ -1057,70 +1087,37 @@ void motor_update() {
       }
 
       if (now > input_last_change_millis + IDLE_DURATION_THRESHOLD && (state & STATE_TOUCH_bm) == 0 && now > touch_state_change_millis + IDLE_DURATION_THRESHOLD) {
-        motor_coast();
+        if(!customSpring.active)motor_coast();
         if (pending_report_on_idle) {
           pending_report_on_idle = false;
           increment_position_nonce();
         }
         set_mode(Mode::MODE_INPUT_IDLE);
-      } else {
+      } else if(!customSpring.active) {
         // Haptics - extract current mode from haptic_config
         HapticMode haptic_mode = static_cast<HapticMode>((haptic_config & HAPTIC_MODE_bm) >> HAPTIC_MODE_bp);
 
-        if (haptic_mode == HAPTIC_SMOOTH_WITH_MAGNET_ENDS) {
-          // Magnetic endpoints - pull toward calibration limits when near
-          uint8_t strength = (haptic_config & HAPTIC_DETENT_STRENGTH_bm) >> HAPTIC_DETENT_STRENGTH_bp;
-          uint8_t max_pwm = get_strength_max_pwm(strength);
-
-          if (input_ewma < input_calib_min + HAPTIC_MAGNET_RANGE && input_ewma > input_calib_min + HAPTIC_DEAD_ZONE) {
-            float delta = (input_calib_min - input_ewma) * HAPTIC_BASE_MULTIPLIER;
-            uint8_t pwm = (-delta + HAPTIC_BASE_PWM > max_pwm) ? max_pwm : -delta + HAPTIC_BASE_PWM;
-            motor_set(-(int16_t)pwm, false, MOTOR_IDLE_COAST);
-          } else if (input_ewma > input_calib_max - HAPTIC_MAGNET_RANGE && input_ewma < input_calib_max - HAPTIC_DEAD_ZONE) {
-            float delta = (input_calib_max - input_ewma) * HAPTIC_BASE_MULTIPLIER;
-            uint8_t pwm = (delta + HAPTIC_BASE_PWM > max_pwm) ? max_pwm : delta + HAPTIC_BASE_PWM;
-            motor_set((int16_t)pwm, false, MOTOR_IDLE_COAST);
-          } else {
-            motor_coast();
-          }
-        } else if (haptic_mode == HAPTIC_DETENTS) {
-          // Detent haptics - pull toward nearest detent position
-          uint8_t detent_count = (haptic_config & HAPTIC_DETENT_COUNT_bm) >> HAPTIC_DETENT_COUNT_bp;
-          uint8_t strength = (haptic_config & HAPTIC_DETENT_STRENGTH_bm) >> HAPTIC_DETENT_STRENGTH_bp;
-          uint8_t max_pwm = get_strength_max_pwm(strength);
-
-          // Get nearest detent position
-          uint16_t nearest_detent = get_nearest_detent_position(detent_count, input_ewma);
-
-          // Calculate displacement from detent (positive = need to move up, negative = need to move down)
-          int16_t displacement = nearest_detent - input_ewma;
-
-          // Apply dead zone
-          if (abs(displacement) > HAPTIC_DEAD_ZONE) {
-            // Calculate restorative force proportional to displacement
-            float delta = displacement * HAPTIC_BASE_MULTIPLIER;
-
-            if (delta > 0) {
-              // Pull toward higher position (Motor A)
-              uint8_t pwm = (delta + HAPTIC_BASE_PWM > max_pwm) ? max_pwm : delta + HAPTIC_BASE_PWM;
-              motor_set((int16_t)pwm, false, MOTOR_IDLE_COAST);
-            } else {
-              // Pull toward lower position (Motor B)
-              uint8_t pwm = (-delta + HAPTIC_BASE_PWM > max_pwm) ? max_pwm : -delta + HAPTIC_BASE_PWM;
-              motor_set(-(int16_t)pwm, false, MOTOR_IDLE_COAST);
-            }
-          } else {
-            // Within dead zone, no force
-            motor_coast();
-          }
-        } else {
-          // No haptics for NO_HAPTICS mode
-          motor_coast();
+        int16_t displacement=0;
+        const int16_t current=input_ewma;
+        if(haptic_mode==HAPTIC_SMOOTH_WITH_MAGNET_ENDS) {
+          if(current<input_calib_min+HAPTIC_MAGNET_RANGE && current>input_calib_min+HAPTIC_DEAD_ZONE)displacement=int16_t(input_calib_min)-current;
+          else if(current>input_calib_max-HAPTIC_MAGNET_RANGE && current<input_calib_max-HAPTIC_DEAD_ZONE)displacement=int16_t(input_calib_max)-current;
+        } else if(haptic_mode==HAPTIC_DETENTS) {
+          displacement=int16_t(get_nearest_detent_position((haptic_config&HAPTIC_DETENT_COUNT_bm)>>HAPTIC_DETENT_COUNT_bp,current))-current;
         }
+        uint16_t distance=displacement<0?-displacement:displacement;
+        int16_t drive=0;
+        if(distance>HAPTIC_DEAD_ZONE) {
+          uint8_t maximum=get_strength_max_pwm((haptic_config&HAPTIC_DETENT_STRENGTH_bm)>>HAPTIC_DETENT_STRENGTH_bp);
+          uint16_t magnitude=distance*3+HAPTIC_BASE_PWM;
+          drive=magnitude>maximum?maximum:magnitude;
+          if(displacement<0)drive=-drive;
+        }
+        motor_set(drive,false,MOTOR_IDLE_COAST);
       }
       break;
     case MODE_INPUT_IDLE:
-      motor_coast();
+      if(!customSpring.active)motor_coast();
 
       // Apply pending layer change
       if (pending_layer_change != 0xFF) {
@@ -1156,6 +1153,16 @@ void motor_update() {
       }
       break;
   }
+
+  if(customSpring.active) {
+    if(active_layer!=customSpring.config[1] || (get_mode()!=MODE_INPUT_IDLE && get_mode()!=MODE_INPUT_ACTIVE)){customSpring.stop();motor_coast();}
+    else {
+      const float scale=1020.0f/(input_calib_max-input_calib_min);
+      motor_set(customSpring.tick((input_ewma-input_calib_min)*scale,
+          velocity_ewma*scale,now),true,MOTOR_IDLE_COAST);
+    }
+  }
+  i2c_custom_active=customSpring.active;
 
   // TODO: lerp bounds...
   uint8_t pos = BOUNDED_LERP_UINT16(position, input_calib_min, input_calib_max, 0, 255);
@@ -1311,8 +1318,14 @@ void process_i2c_requests() {
   uint8_t debug_drive_duty = 0;
 #endif
 
+  uint8_t customConfig[custom_haptics::size];
+  bool hasCustom=false,renewCustom=false;
   // Atomically copy all i2c requests in a single critical section
   noInterrupts();
+
+  hasCustom=i2c_custom_pending;i2c_custom_pending=false;
+  if(hasCustom)for(uint8_t i=0;i<custom_haptics::size;++i)customConfig[i]=i2c_custom_config[i];
+  renewCustom=i2c_custom_renew;i2c_custom_renew=false;
 
   clear_error = i2c_clear_error_request;
   i2c_clear_error_request = false;
@@ -1360,6 +1373,14 @@ void process_i2c_requests() {
   interrupts();
 
   // Process all requests outside critical section
+
+  // Ordinary control commands win over a simultaneous custom request.
+  const bool cancelCustom=enter_bootloader || clear_error || self_cal || has_layer_target || layer_change!=0xFF || has_layer_haptic;
+  if(cancelCustom)customSpring.stop();
+  else if(get_mode()==MODE_INPUT_IDLE || get_mode()==MODE_INPUT_ACTIVE) {
+    if(hasCustom && customConfig[1]==active_layer && haptic_config==0 && pending_layer_change==0xFF)customSpring.apply(customConfig,millis());
+    if(renewCustom)customSpring.renew(millis());
+  }
 
   if (enter_bootloader) {
     // Stash the entry token in .noinit RAM and trigger a software reset. The
@@ -1522,6 +1543,7 @@ void ptc_event_callback(const ptc_cb_event_t eventType, cap_sensor_t* node) {
     touch_state_change_millis = millis();
     state |= STATE_TOUCH_bm;
 
+  #if FB_ENABLE_DOUBLE_TAP
     // Tap detection
     if (tap_state == TAP_NONE) {
       // First tap touch detected
@@ -1539,6 +1561,7 @@ void ptc_event_callback(const ptc_cb_event_t eventType, cap_sensor_t* node) {
         reset_tap_detection();
       }
     }
+  #endif
   } else if (PTC_CB_EVENT_TOUCH_RELEASE == eventType) {
     // MySerial.print("node released:");
     // MySerial.println(ptc_get_node_id(node));
@@ -1547,6 +1570,7 @@ void ptc_event_callback(const ptc_cb_event_t eventType, cap_sensor_t* node) {
     touch_state_change_millis = millis();
     state &= ~STATE_TOUCH_bm;
 
+  #if FB_ENABLE_DOUBLE_TAP
     // Tap detection: validate tap on release
     if (tap_state == TAP_FIRST_PRESSED || tap_state == TAP_SECOND_PRESSED) {
       uint32_t now = millis();
@@ -1584,6 +1608,7 @@ void ptc_event_callback(const ptc_cb_event_t eventType, cap_sensor_t* node) {
         reset_tap_detection();
       }
     }
+  #endif
   } else if (PTC_CB_EVENT_CONV_SELF_CMPL == eventType) {
     // Do more complex things here
   } else if (PTC_CB_EVENT_CONV_CALIB & eventType) {

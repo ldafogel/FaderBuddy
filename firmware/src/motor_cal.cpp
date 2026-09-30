@@ -81,7 +81,7 @@ MotorCalData motor_cal = {0, {0, 0}, {0, 0}, {0, 0}};
 static uint32_t self_calibration_start = 0;
 static uint8_t self_calibration_stage = 0;
 #define SELF_CALIBRATION_TIMEOUT (1500)
-#define SELF_CALIBRATION_BUFFER (0.995)  // Buffer factor to prevent hitting physical limits
+#define SELF_CALIBRATION_WEIGHT (199UL) // 199/200 = 0.995 endpoint buffer
 static uint16_t self_calibration_adc_stage_0 = 0;
 static uint16_t self_calibration_adc_stage_1 = 0;
 
@@ -248,8 +248,8 @@ MotorCalResult motorcal_tick(uint32_t now, uint16_t adc_raw) {
         // ends stay clear of the mechanical stops. Halved because the
         // stage readings are raw (2x accumulation) and the bounds are
         // compared against input_ewma, which is in ADC counts.
-        input_calib_min = (SELF_CALIBRATION_BUFFER * self_calibration_adc_stage_0 + (1.0 - SELF_CALIBRATION_BUFFER) * self_calibration_adc_stage_1) / 2;
-        input_calib_max = (SELF_CALIBRATION_BUFFER * self_calibration_adc_stage_1 + (1.0 - SELF_CALIBRATION_BUFFER) * self_calibration_adc_stage_0) / 2;
+        input_calib_min = (SELF_CALIBRATION_WEIGHT * self_calibration_adc_stage_0 + self_calibration_adc_stage_1) / 400;
+        input_calib_max = (SELF_CALIBRATION_WEIGHT * self_calibration_adc_stage_1 + self_calibration_adc_stage_0) / 400;
 
         // Endpoints are known, so the motor characterisation that follows
         // has a calibrated span to keep itself inside. Persist once, at the
